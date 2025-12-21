@@ -1,0 +1,43 @@
+version: '3.8'
+services:
+  backend:
+    build: ./backend
+    container_name: backend
+    ports:
+      - "4000:3000"
+    environment:
+      - NODE_ENV=development
+    networks:
+      - app-net
+    volumes:
+      - ./backend:/usr/src/app
+      - /usr/src/app/node_modules
+  frontend:
+    build: ./frontend
+    container_name: frontend
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+    networks:
+      - app-net
+    volumes:
+      - ./frontend:/app
+  db:
+    image: postgres:15
+    container_name: app_db
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: mydb
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - app-net
+
+volumes:
+  db-data:
+
+networks:
+  app-net:
+    driver: bridge
