@@ -1,0 +1,91 @@
+name: Main → Staging CI/CD
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  ECR_REPO_FRONTEND: reactnodetesting-frontend
+  ECR_REPO_BACKEND: reactnodetesting-backend
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install & Test backend
+        run: |
+          cd backend
+          npm i
+          npm test
+
+      - name: Lint & Build frontend
+        run: |
+          cd frontend
+          npm i
+          npm test || true
+          npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and push images
+        run: |
+          BACK_IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO_BACKEND }}:main-${{ github.run_id }}
+          FRONT_IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO_FRONTEND }}:main-${{ github.run_id }}
+          cd backend
+          docker build -t $BACK_IMAGE .
+          docker push $BACK_IMAGE
+          cd ../frontend
+          docker build -t $FRONT_IMAGE .
+          docker push $FRONT_IMAGE
+
+      - name: Deploy to Staging EC2 via SSH
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.STAGING_EC2_HOST }}
+          username: ${{ secrets.STAGING_EC2_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY_STAGING }}
+          script: |
+            cd /home/${{ secrets.STAGING_EC2_USER }}/deploy
+            docker-compose pull
+            docker-compose up -d --remove-orphans
+
+      - name: Send success email to users
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Main deployed to Staging — ${{ github.repository }}"
+          to: ${{ secrets.NOTIFY_EMAILS }}
+          body: |
+            Main branch changes have been deployed to Staging.
+            Access the app at: http://${{ secrets.STAGING_EC2_HOST }}
+
+      - name: Send failure email to devs + instructor
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Staging deploy failed — ${{ github.repository }}"
+          to: ${{ secrets.NOTIFY_EMAILS }}
+          body: 'Staging deployment failed — check the Actions logs.'

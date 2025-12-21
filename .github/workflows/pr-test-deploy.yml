@@ -1,0 +1,114 @@
+name: PR → Test Env CI/CD
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  ECR_REPO_FRONTEND: reactnodetesting-frontend
+  ECR_REPO_BACKEND: reactnodetesting-backend
+
+jobs:
+  build-test-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install backend deps
+        run: |
+          cd backend
+          npm i
+
+      - name: Run backend unit tests
+        run: |
+          cd backend
+          npm test
+
+      - name: Lint backend
+        run: |
+          cd backend
+          npm run lint || true
+
+      - name: Build backend
+        run: |
+          cd backend
+          npm run build || true
+
+      - name: Install frontend deps & tests
+        run: |
+          cd frontend
+          npm i
+          npm test || true
+          npm run lint || true
+          npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag and push backend image to ECR
+        run: |
+          FRONT_IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO_BACKEND }}:pr-${{ github.run_id }}
+          cd backend
+          docker build -t $FRONT_IMAGE .
+          docker push $FRONT_IMAGE
+
+      - name: Build, tag and push frontend image to ECR
+        run: |
+          FE_IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO_FRONTEND }}:pr-${{ github.run_id }}
+          cd frontend
+          docker build -t $FE_IMAGE .
+          docker push $FE_IMAGE
+
+      - name: Deploy to Testing EC2 via SSH
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.TESTING_EC2_HOST }}
+          username: ${{ secrets.TESTING_EC2_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY_TESTING }}
+          port: 22
+          script: |
+            cd /home/${{ secrets.TESTING_EC2_USER }}/deploy
+            # pull new images (ECR login is handled by instance role) -- substitute tags accordingly
+            docker-compose pull
+            docker-compose up -d --remove-orphans
+
+      - name: Send success email to QA
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "PR Build Deployed to Testing — ${{ github.repository }}"
+          to: ${{ secrets.NOTIFY_EMAILS }}
+          body: |
+            Build and deployment to Testing completed successfully.
+            Access the app at: http://${{ secrets.TESTING_EC2_HOST }}
+
+      - name: Send failure email to developer & instructor
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "PR Build Failed — ${{ github.repository }}"
+          to: ${{ secrets.NOTIFY_EMAILS }}
+          body: |
+            The PR workflow failed. Check GitHub Actions for details: ${{ github.run_id }}
