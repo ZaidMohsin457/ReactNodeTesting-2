@@ -120,6 +120,13 @@ jobs:
             # Export ECR_REGISTRY for docker-compose
             export ECR_REGISTRY=$ECR_REGISTRY
             
+            # Stop and remove existing containers to free up ports
+            docker-compose -f docker-compose.deploy.yml down --remove-orphans || true
+            
+            # Also stop any containers using port 80
+            docker ps -q --filter "publish=80" | xargs -r docker stop || true
+            docker ps -aq --filter "publish=80" | xargs -r docker rm || true
+            
             # Pull and deploy using the deployment compose file
             docker-compose -f docker-compose.deploy.yml pull
             docker-compose -f docker-compose.deploy.yml up -d --remove-orphans
