@@ -1,4 +1,5 @@
 name: Main → Staging CI/CD
+
 on:
   push:
     branches: [ main ]
@@ -11,27 +12,41 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Setup Node
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
         uses: actions/setup-node@v4
         with:
           node-version: 18
 
-      - name: Install & Test backend
-        run: |
-          cd backend
-          npm i
-          npm test
+      # ================= BACKEND =================
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
 
-      - name: Lint & Build frontend
+      - name: Run backend tests
+        working-directory: backend
+        run: npm test
+
+      - name: Lint backend
+        working-directory: backend
+        run: npm run lint || true
+
+      # ================= FRONTEND =================
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Test & build frontend
+        working-directory: frontend
         run: |
-          cd frontend
-          npm i
           npm test || true
           npm run build
 
+      # ================= AWS =================
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
@@ -39,32 +54,77 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to ECR
-        uses: aws-actions/amazon-ecr-login@v1
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push images
+      # ================= BUILD & PUSH =================
+      - name: Build & push backend image
+        working-directory: backend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          BACK_IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO_BACKEND }}:main-${{ github.run_id }}
-          FRONT_IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO_FRONTEND }}:main-${{ github.run_id }}
-          cd backend
-          docker build -t $BACK_IMAGE .
-          docker push $BACK_IMAGE
-          cd ../frontend
-          docker build -t $FRONT_IMAGE .
-          docker push $FRONT_IMAGE
+          IMAGE=$ECR_REGISTRY/${{ env.ECR_REPO_BACKEND }}
+          docker build -t $IMAGE:main-${{ github.run_id }} -t $IMAGE:latest .
+          docker push $IMAGE:main-${{ github.run_id }}
+          docker push $IMAGE:latest
 
-      - name: Deploy to Staging EC2 via SSH
-        uses: appleboy/ssh-action@v0.1.7
+      - name: Build & push frontend image
+        working-directory: frontend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE=$ECR_REGISTRY/${{ env.ECR_REPO_FRONTEND }}
+          docker build -t $IMAGE:main-${{ github.run_id }} -t $IMAGE:latest .
+          docker push $IMAGE:main-${{ github.run_id }}
+          docker push $IMAGE:latest
+
+      # ================= COPY COMPOSE FILE =================
+      - name: Copy docker-compose file to Staging EC2
+        uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.STAGING_EC2_HOST }}
           username: ${{ secrets.STAGING_EC2_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY_STAGING }}
-          script: |
-            cd /home/${{ secrets.STAGING_EC2_USER }}/deploy
-            docker-compose pull
-            docker-compose up -d --remove-orphans
+          port: 22
+          source: "docker-compose.deploy.yml"
+          target: "/home/${{ secrets.STAGING_EC2_USER }}/deploy/"
+          strip_components: 0
 
-      - name: Send success email to users
+      # ================= DEPLOY =================
+      - name: Deploy to Staging EC2
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        with:
+          host: ${{ secrets.STAGING_EC2_HOST }}
+          username: ${{ secrets.STAGING_EC2_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY_STAGING }}
+          port: 22
+          envs: AWS_REGION,AWS_ACCOUNT_ID,ECR_REGISTRY
+          script: |
+            set -e
+            
+            # Navigate to deploy directory
+            cd /home/${{ secrets.STAGING_EC2_USER }}/deploy
+            
+            # Login to ECR
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+            
+            # Export ECR_REGISTRY for docker-compose
+            export ECR_REGISTRY=$ECR_REGISTRY
+            
+            # Pull and deploy using the deployment compose file
+            docker-compose -f docker-compose.deploy.yml pull
+            docker-compose -f docker-compose.deploy.yml up -d --remove-orphans
+            
+            # Clean up old images
+            docker image prune -f || true
+
+      # ================= EMAILS =================
+      - name: Send success email
         if: success()
         uses: dawidd6/action-send-mail@v3
         with:
@@ -72,13 +132,26 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "Main deployed to Staging — ${{ github.repository }}"
+          subject: "✅ Main Deployed to Staging — ${{ github.repository }}"
           to: ${{ secrets.NOTIFY_EMAILS }}
+          from: ${{ secrets.SMTP_USERNAME }}
           body: |
-            Main branch changes have been deployed to Staging.
-            Access the app at: http://${{ secrets.STAGING_EC2_HOST }}
+            🎉 Staging Deployment Successful!
+            
+            Repository: ${{ github.repository }}
+            Branch: main
+            Commit: ${{ github.sha }}
+            Author: ${{ github.actor }}
+            
+            Access the deployed application at:
+            🔗 http://${{ secrets.STAGING_EC2_HOST }}
+            
+            Frontend: http://${{ secrets.STAGING_EC2_HOST }}:80
+            Backend API: http://${{ secrets.STAGING_EC2_HOST }}:4000
+            
+            Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-      - name: Send failure email to devs + instructor
+      - name: Send failure email
         if: failure()
         uses: dawidd6/action-send-mail@v3
         with:
@@ -86,6 +159,16 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "Staging deploy failed — ${{ github.repository }}"
+          subject: "❌ Staging Deployment Failed — ${{ github.repository }}"
           to: ${{ secrets.NOTIFY_EMAILS }}
-          body: 'Staging deployment failed — check the Actions logs.'
+          from: ${{ secrets.SMTP_USERNAME }}
+          body: |
+            ⚠️ Staging Deployment Failed!
+            
+            Repository: ${{ github.repository }}
+            Branch: main
+            Commit: ${{ github.sha }}
+            Author: ${{ github.actor }}
+            
+            Please check the GitHub Actions logs for details:
+            🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

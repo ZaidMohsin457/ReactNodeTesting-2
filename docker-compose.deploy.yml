@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  backend:
+    image: ${ECR_REGISTRY}/reactnodetesting-backend:latest
+    container_name: backend
+    restart: unless-stopped
+    ports:
+      - "4000:3000"
+    environment:
+      - NODE_ENV=production
+    networks:
+      - app-net
+    depends_on:
+      - db
+
+  frontend:
+    image: ${ECR_REGISTRY}/reactnodetesting-frontend:latest
+    container_name: frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    networks:
+      - app-net
+
+  db:
+    image: postgres:15
+    container_name: app_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: mydb
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - app-net
+
+volumes:
+  db-data:
+
+networks:
+  app-net:
+    driver: bridge
+

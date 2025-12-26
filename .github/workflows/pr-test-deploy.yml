@@ -55,43 +55,73 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v1
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
       # ================= BUILD & PUSH =================
       - name: Build & push backend image
         working-directory: backend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO_BACKEND }}
+          IMAGE=$ECR_REGISTRY/${{ env.ECR_REPO_BACKEND }}
           docker build -t $IMAGE:pr-${{ github.run_id }} -t $IMAGE:latest .
           docker push $IMAGE:pr-${{ github.run_id }}
           docker push $IMAGE:latest
 
       - name: Build & push frontend image
         working-directory: frontend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO_FRONTEND }}
+          IMAGE=$ECR_REGISTRY/${{ env.ECR_REPO_FRONTEND }}
           docker build -t $IMAGE:pr-${{ github.run_id }} -t $IMAGE:latest .
           docker push $IMAGE:pr-${{ github.run_id }}
           docker push $IMAGE:latest
 
-      # ================= DEPLOY =================
-      - name: Deploy to Testing EC2
-        uses: appleboy/ssh-action@v0.1.7
+      # ================= COPY COMPOSE FILE =================
+      - name: Copy docker-compose file to Testing EC2
+        uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.TESTING_EC2_HOST }}
           username: ${{ secrets.TESTING_EC2_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY_TESTING }}
           port: 22
+          source: "docker-compose.deploy.yml"
+          target: "/home/${{ secrets.TESTING_EC2_USER }}/deploy/"
+          strip_components: 0
+
+      # ================= DEPLOY =================
+      - name: Deploy to Testing EC2
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        with:
+          host: ${{ secrets.TESTING_EC2_HOST }}
+          username: ${{ secrets.TESTING_EC2_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY_TESTING }}
+          port: 22
+          envs: AWS_REGION,AWS_ACCOUNT_ID,ECR_REGISTRY
           script: |
             set -e
+            
+            # Navigate to deploy directory
             cd /home/${{ secrets.TESTING_EC2_USER }}/deploy
-
-            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
-              | docker login --username AWS --password-stdin \
-                ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
-
-            docker-compose pull
-            docker-compose up -d --remove-orphans
+            
+            # Login to ECR
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+            
+            # Export ECR_REGISTRY for docker-compose
+            export ECR_REGISTRY=$ECR_REGISTRY
+            
+            # Pull and deploy using the deployment compose file
+            docker-compose -f docker-compose.deploy.yml pull
+            docker-compose -f docker-compose.deploy.yml up -d --remove-orphans
+            
+            # Clean up old images
+            docker image prune -f || true
 
       # ================= EMAILS =================
       - name: Send success email
@@ -102,11 +132,23 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "PR Deployed to Testing — ${{ github.repository }}"
+          subject: "✅ PR Deployed to Testing — ${{ github.repository }}"
           to: ${{ secrets.NOTIFY_EMAILS }}
+          from: ${{ secrets.SMTP_USERNAME }}
           body: |
-            Deployment successful.
-            URL: http://${{ secrets.TESTING_EC2_HOST }}
+            🎉 Deployment Successful!
+            
+            Repository: ${{ github.repository }}
+            PR: #${{ github.event.pull_request.number }}
+            Author: ${{ github.event.pull_request.user.login }}
+            
+            Access the deployed application at:
+            🔗 http://${{ secrets.TESTING_EC2_HOST }}
+            
+            Frontend: http://${{ secrets.TESTING_EC2_HOST }}:80
+            Backend API: http://${{ secrets.TESTING_EC2_HOST }}:4000
+            
+            Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
       - name: Send failure email
         if: failure()
@@ -116,9 +158,15 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "PR Deployment Failed — ${{ github.repository }}"
+          subject: "❌ PR Deployment Failed — ${{ github.repository }}"
           to: ${{ secrets.NOTIFY_EMAILS }}
+          from: ${{ secrets.SMTP_USERNAME }}
           body: |
-            Deployment failed.
-            Check GitHub Actions logs.
-
+            ⚠️ Deployment Failed!
+            
+            Repository: ${{ github.repository }}
+            PR: #${{ github.event.pull_request.number }}
+            Author: ${{ github.event.pull_request.user.login }}
+            
+            Please check the GitHub Actions logs for details:
+            🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
