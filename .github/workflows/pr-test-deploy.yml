@@ -58,6 +58,11 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Get ECR login password
+        id: ecr-password
+        run: |
+          echo "password=$(aws ecr get-login-password --region ${{ secrets.AWS_REGION }})" >> $GITHUB_OUTPUT
+
       # ================= BUILD & PUSH =================
       - name: Build & push backend image
         working-directory: backend
@@ -95,23 +100,22 @@ jobs:
       - name: Deploy to Testing EC2
         uses: appleboy/ssh-action@v1.0.3
         env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_PASSWORD: ${{ steps.ecr-password.outputs.password }}
         with:
           host: ${{ secrets.TESTING_EC2_HOST }}
           username: ${{ secrets.TESTING_EC2_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY_TESTING }}
           port: 22
-          envs: AWS_REGION,AWS_ACCOUNT_ID,ECR_REGISTRY
+          envs: ECR_REGISTRY,ECR_PASSWORD
           script: |
             set -e
             
             # Navigate to deploy directory
             cd /home/${{ secrets.TESTING_EC2_USER }}/deploy
             
-            # Login to ECR
-            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+            # Login to ECR using password from GitHub Actions
+            echo "$ECR_PASSWORD" | docker login --username AWS --password-stdin $ECR_REGISTRY
             
             # Export ECR_REGISTRY for docker-compose
             export ECR_REGISTRY=$ECR_REGISTRY
